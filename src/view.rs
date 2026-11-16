@@ -3,9 +3,9 @@ use crate::treemap::TreemapLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
-    Flat,        // Classic SpaceSniffer warm amber / brown
-    FileClasses, // Category-based: media, code, archives, etc.
-    Depth,       // Color shifted by directory depth
+    Flat,
+    FileClasses,
+    Depth,
 }
 
 pub struct TabView {
@@ -17,7 +17,7 @@ pub struct TabView {
     pub filter_query: String,
     pub filter_criteria: FilterCriteria,
     pub color_mode: ColorMode,
-    pub detail_level: u16, // Base size threshold for expanding nested folders.
+    pub detail_level: u16,
     pub treemap: TreemapLayout,
 }
 
@@ -32,7 +32,7 @@ impl TabView {
             filter_query: String::new(),
             filter_criteria: FilterCriteria::default(),
             color_mode: ColorMode::Flat,
-            detail_level: 4,
+            detail_level: 5,
             treemap: TreemapLayout::new(),
         }
     }

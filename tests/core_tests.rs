@@ -227,4 +227,44 @@ mod tests {
 
         let _ = std::fs::remove_file(report_file);
     }
+
+    #[test]
+    fn test_single_child_folder_chain_collapses_into_one_tile() {
+        let mut tree = FileTree::new(PathBuf::from("/test"));
+        let d1 = tree.add_child(
+            0,
+            FileNode::new(0, PathBuf::from("/test/com.docker.docker"), "com.docker.docker".to_string(), FileKind::Directory, 0, None),
+        );
+        let d2 = tree.add_child(
+            d1,
+            FileNode::new(0, PathBuf::from("/test/com.docker.docker/Data"), "Data".to_string(), FileKind::Directory, 0, None),
+        );
+        let d3 = tree.add_child(
+            d2,
+            FileNode::new(0, PathBuf::from("/test/com.docker.docker/Data/vms"), "vms".to_string(), FileKind::Directory, 0, None),
+        );
+        let d4 = tree.add_child(
+            d3,
+            FileNode::new(0, PathBuf::from("/test/com.docker.docker/Data/vms/0"), "0".to_string(), FileKind::Directory, 0, None),
+        );
+        let d5 = tree.add_child(
+            d4,
+            FileNode::new(0, PathBuf::from("/test/com.docker.docker/Data/vms/0/data"), "data".to_string(), FileKind::Directory, 0, None),
+        );
+        let file_id = tree.add_child(
+            d5,
+            FileNode::new(0, PathBuf::from("/test/com.docker.docker/Data/vms/0/data/Docker.raw"), "Docker.raw".to_string(), FileKind::File, 50_000, None),
+        );
+
+        let mut layout = TreemapLayout::new();
+        layout.compute(&tree, 0, Rect::new(0, 0, 80, 24), 5, 2, 4, &|_| true);
+
+        let collapsed_tile = layout.tiles.iter().find(|t| t.node_id == d5).unwrap();
+        assert_eq!(
+            collapsed_tile.collapsed_label.as_deref(),
+            Some("com.docker.docker/Data/vms/0/data")
+        );
+        assert!(layout.tiles.iter().any(|t| t.node_id == file_id));
+        assert!(!layout.tiles.iter().any(|t| t.node_id == d1));
+    }
 }

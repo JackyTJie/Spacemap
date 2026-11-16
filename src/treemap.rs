@@ -11,6 +11,7 @@ pub struct VisibleTile {
     pub is_dir: bool,
     pub display_size: u64,
     pub share_of_parent: f64,
+    pub collapsed_label: Option<String>,
 }
 
 pub struct TreemapLayout {
@@ -60,6 +61,7 @@ impl TreemapLayout {
             is_dir: root.is_dir(),
             display_size: root_size,
             share_of_parent: 1.0,
+            collapsed_label: None,
         });
 
         self.layout_children(
@@ -94,9 +96,9 @@ impl TreemapLayout {
         let interior = if current_depth == 1 {
             parent_rect
         } else {
-            if parent_rect.width < min_width.saturating_mul(5).max(6)
-                || parent_rect.height < min_height.saturating_mul(4).max(4)
-            {
+            let req_w = min_width.saturating_mul(4).max(16);
+            let req_h = min_height.saturating_mul(3).max(6);
+            if parent_rect.width < req_w || parent_rect.height < req_h {
                 return;
             }
             Rect::new(
@@ -115,13 +117,15 @@ impl TreemapLayout {
             return;
         };
 
-        let mut children_info: Vec<(usize, u64)> = Vec::new();
+        let mut children_info: Vec<(usize, u64, Option<String>)> = Vec::new();
         let mut total_child_size = 0u64;
 
         for &child_id in &parent.children {
             if let Some(&sz) = effective_sizes.get(&child_id) {
                 if sz > 0 {
-                    children_info.push((child_id, sz));
+                    let (target_id, collapsed_label) =
+                        collapse_single_child_chain(tree, child_id, sz, effective_sizes);
+                    children_info.push((target_id, sz, collapsed_label));
                     total_child_size = total_child_size.saturating_add(sz);
                 }
             }
@@ -133,18 +137,46 @@ impl TreemapLayout {
 
         children_info.sort_by(|a, b| b.1.cmp(&a.1));
 
+        let parent_area = interior.width as f64 * interior.height as f64;
+        let min_tile_area = if current_depth == 1 {
+            (min_width as f64 * min_height as f64 * 0.75).max(4.0)
+        } else {
+            (min_width as f64 * min_height as f64 * 1.5).max(12.0)
+        };
+
+        let mut visible_children: Vec<(usize, u64, Option<String>)> = Vec::new();
+        let mut visible_total_size = 0u64;
+
+        for (idx, item) in children_info.into_iter().enumerate() {
+            let expected_area = (item.1 as f64 / total_child_size as f64) * parent_area;
+            if idx == 0 || expected_area >= min_tile_area || visible_children.len() < 3 {
+                visible_total_size = visible_total_size.saturating_add(item.1);
+                visible_children.push(item);
+            }
+            if visible_children.len() >= 48 {
+                break;
+            }
+        }
+
+        if visible_children.is_empty() || visible_total_size == 0 {
+            return;
+        }
+
         let rects = squarify(
             interior,
-            &children_info
+            &visible_children
                 .iter()
-                .map(|(_, sz)| *sz as f64)
+                .map(|(_, sz, _)| *sz as f64)
                 .collect::<Vec<_>>(),
-            total_child_size as f64,
+            visible_total_size as f64,
         );
 
-        for (i, &(child_id, sz)) in children_info.iter().enumerate() {
+        for (i, (child_id, sz, collapsed_label)) in visible_children.into_iter().enumerate() {
             let mut child_rect = rects[i];
             if child_rect.width < 1 || child_rect.height < 1 {
+                continue;
+            }
+            if current_depth > 1 && (child_rect.width < 4 || child_rect.height < 2) {
                 continue;
             }
 
@@ -174,6 +206,7 @@ impl TreemapLayout {
                 is_dir: child.is_dir(),
                 display_size: sz,
                 share_of_parent: share,
+                collapsed_label,
             });
 
             if child.is_dir() && !child.children.is_empty() {
@@ -190,6 +223,58 @@ impl TreemapLayout {
                 self.tiles[tile_index].is_leaf = self.tiles.len() == tile_index + 1;
             }
         }
+    }
+}
+
+fn collapse_single_child_chain(
+    tree: &FileTree,
+    start_id: usize,
+    start_size: u64,
+    effective_sizes: &HashMap<usize, u64>,
+) -> (usize, Option<String>) {
+    let Some(start_node) = tree.get(start_id) else {
+        return (start_id, None);
+    };
+    if !start_node.is_dir() {
+        return (start_id, None);
+    }
+
+    let mut curr_id = start_id;
+    let mut names = vec![start_node.name.clone()];
+
+    while let Some(node) = tree.get(curr_id) {
+        if !node.is_dir() || names.len() >= 6 {
+            break;
+        }
+        let mut active_dirs = Vec::new();
+        let mut active_files = 0usize;
+        for &cid in &node.children {
+            if let Some(&csz) = effective_sizes.get(&cid) {
+                if csz > 0 {
+                    if let Some(cnode) = tree.get(cid) {
+                        if cnode.is_dir() && csz * 100 >= start_size * 98 {
+                            active_dirs.push((cid, cnode.name.clone()));
+                        } else {
+                            active_files += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if active_dirs.len() == 1 && active_files == 0 {
+            let (next_id, next_name) = active_dirs.pop().unwrap();
+            names.push(next_name);
+            curr_id = next_id;
+        } else {
+            break;
+        }
+    }
+
+    if names.len() > 1 {
+        (curr_id, Some(names.join("/")))
+    } else {
+        (start_id, None)
     }
 }
 

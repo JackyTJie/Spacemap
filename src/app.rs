@@ -165,7 +165,10 @@ impl App {
                     if let Some(&node_id) = self.path_to_id.get(&path) {
                         if let Ok(metadata) = std::fs::symlink_metadata(&path) {
                             if metadata.file_type().is_file() {
-                                self.tree.update_node_size(node_id, metadata.len());
+                                self.tree.update_node_size(
+                                    node_id,
+                                    crate::scanner::physical_file_size(&metadata),
+                                );
                                 self.tree.set_flash(node_id, Duration::from_millis(1500));
                                 tree_changed = true;
                             }
@@ -215,13 +218,21 @@ impl App {
         let min_wh = tab.detail_level;
         let filter_criteria = tab.filter_criteria.clone();
 
+        let max_depth = match min_wh {
+            0..=2 => 8,
+            3..=4 => 6,
+            5..=6 => 4,
+            7..=9 => 3,
+            _ => 2,
+        };
+
         tab.treemap.compute(
             &self.tree,
             root_id,
             canvas_rect,
             min_wh,
-            (min_wh / 2).max(1),
-            12,
+            (min_wh / 2).max(2),
+            max_depth,
             &|node| filter_criteria.matches(node),
         );
 

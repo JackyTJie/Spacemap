@@ -263,7 +263,8 @@ fn draw_tile(
         Color::Rgb(65, 51, 41)
     };
 
-    let mut title = Line::from(Span::styled(fit(&node.name, width), bold(title_fg)));
+    let label_str = tile.collapsed_label.as_deref().unwrap_or(&node.name);
+    let mut title = Line::from(Span::styled(fit(label_str, width), bold(title_fg)));
     let inline_size = title.width() + 2 + size.as_str().width() <= width;
     if inline_size {
         title.spans.push(Span::styled(

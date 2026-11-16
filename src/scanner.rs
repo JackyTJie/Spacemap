@@ -85,13 +85,32 @@ pub fn start_scanner(root_path: PathBuf) -> (Receiver<ScannerMsg>, ScannerContro
     )
 }
 
+pub fn physical_file_size(metadata: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
 fn is_pseudo_filesystem(path: &Path, root: &Path) -> bool {
     if path == root {
         return false;
     }
     #[cfg(target_os = "linux")]
     {
-        const PSEUDO_DIRS: [&str; 6] = ["/proc", "/sys", "/dev", "/run", "/sys/fs/cgroup", "/proc/sys"];
+        const PSEUDO_DIRS: [&str; 6] = [
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/sys/fs/cgroup",
+            "/proc/sys",
+        ];
         if let Some(s) = path.to_str() {
             if PSEUDO_DIRS.contains(&s) {
                 return true;
@@ -100,7 +119,9 @@ fn is_pseudo_filesystem(path: &Path, root: &Path) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        if path == Path::new("/dev") || (root == Path::new("/") && path == Path::new("/System/Volumes/Data")) {
+        if path == Path::new("/dev")
+            || (root == Path::new("/") && path == Path::new("/System/Volumes/Data"))
+        {
             return true;
         }
     }
@@ -199,15 +220,16 @@ fn scan_directory(root: PathBuf, tx: Sender<ScannerMsg>, stop_flag: Arc<AtomicBo
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt;
-                    if metadata.nlink() > 1 && !seen_inodes.insert((metadata.dev(), metadata.ino())) {
+                    if metadata.nlink() > 1 && !seen_inodes.insert((metadata.dev(), metadata.ino()))
+                    {
                         0
                     } else {
-                        metadata.len()
+                        physical_file_size(&metadata)
                     }
                 }
                 #[cfg(not(unix))]
                 {
-                    metadata.len()
+                    physical_file_size(&metadata)
                 }
             } else {
                 0
