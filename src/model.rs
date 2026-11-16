@@ -12,12 +12,12 @@ pub enum FileKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileClass {
     Directory,
-    Archive,   // zip, tar, gz, 7z, rar, iso, img, deb, rpm
-    Media,     // mp4, mkv, avi, mp3, flac, wav, png, jpg, webp, svg
-    Document,  // pdf, doc, docx, txt, md, rst, xlsx, pptx
-    Code,      // rs, py, js, ts, c, cpp, h, hpp, go, java, html, css, json, yaml, toml, xml
-    Binary,    // exe, so, dll, bin, o, a, dylib
-    DiskImage, // iso, qcow2, vmdk, img, dmg
+    Archive,
+    Media,
+    Document,
+    Code,
+    Binary,
+    DiskImage,
     Other,
 }
 
@@ -25,15 +25,21 @@ impl FileClass {
     pub fn from_extension(ext: &str) -> Self {
         let ext = ext.to_lowercase();
         match ext.as_str() {
-            "zip" | "tar" | "gz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "deb" | "rpm" => FileClass::Archive,
+            "zip" | "tar" | "gz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "deb" | "rpm" => {
+                FileClass::Archive
+            }
             "iso" | "img" | "qcow2" | "vmdk" | "dmg" => FileClass::DiskImage,
-            "mp4" | "mkv" | "avi" | "mov" | "webm" | "mp3" | "flac" | "wav" | "ogg" |
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" => FileClass::Media,
-            "pdf" | "doc" | "docx" | "txt" | "md" | "rst" | "xlsx" | "csv" | "pptx" | "epub" => FileClass::Document,
-            "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "cc" |
-            "go" | "java" | "kt" | "swift" | "html" | "css" | "scss" | "json" | "yaml" | "yml" |
-            "toml" | "xml" | "sh" | "bash" | "zsh" | "lua" | "sql" | "vim" => FileClass::Code,
-            "exe" | "so" | "dll" | "dylib" | "bin" | "o" | "a" | "class" | "wasm" => FileClass::Binary,
+            "mp4" | "mkv" | "avi" | "mov" | "webm" | "mp3" | "flac" | "wav" | "ogg" | "png"
+            | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" => FileClass::Media,
+            "pdf" | "doc" | "docx" | "txt" | "md" | "rst" | "xlsx" | "csv" | "pptx" | "epub" => {
+                FileClass::Document
+            }
+            "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "cc" | "go"
+            | "java" | "kt" | "swift" | "html" | "css" | "scss" | "json" | "yaml" | "yml"
+            | "toml" | "xml" | "sh" | "bash" | "zsh" | "lua" | "sql" | "vim" => FileClass::Code,
+            "exe" | "so" | "dll" | "dylib" | "bin" | "o" | "a" | "class" | "wasm" => {
+                FileClass::Binary
+            }
             _ => FileClass::Other,
         }
     }
@@ -46,19 +52,27 @@ pub struct FileNode {
     pub name: String,
     pub kind: FileKind,
     pub class: FileClass,
-    pub size: u64,           // For dirs: total recursive size of all items
-    pub direct_size: u64,    // For files: file size; for dirs: metadata size
+    pub size: u64,
+    pub direct_size: u64,
     pub children: Vec<usize>,
     pub parent: Option<usize>,
     pub modified: Option<SystemTime>,
-    pub tag: Option<u8>,     // 1, 2, 3, 4
-    pub flash_until: Option<SystemTime>, // For live change tracking
-    pub file_count: usize,   // Number of files under this folder
-    pub dir_count: usize,    // Number of directories under this folder
+    pub tag: Option<u8>,
+    pub flash_until: Option<SystemTime>,
+    pub file_count: usize,
+    pub dir_count: usize,
+    pub deleted: bool,
 }
 
 impl FileNode {
-    pub fn new(id: usize, path: PathBuf, name: String, kind: FileKind, direct_size: u64, modified: Option<SystemTime>) -> Self {
+    pub fn new(
+        id: usize,
+        path: PathBuf,
+        name: String,
+        kind: FileKind,
+        direct_size: u64,
+        modified: Option<SystemTime>,
+    ) -> Self {
         let class = if kind == FileKind::Directory {
             FileClass::Directory
         } else {
@@ -87,6 +101,7 @@ impl FileNode {
             flash_until: None,
             file_count,
             dir_count,
+            deleted: false,
         }
     }
 
@@ -103,7 +118,8 @@ pub struct FileTree {
 
 impl FileTree {
     pub fn new(root_path: PathBuf) -> Self {
-        let root_name = root_path.file_name()
+        let root_name = root_path
+            .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("/")
             .to_string();
@@ -116,11 +132,11 @@ impl FileTree {
     }
 
     pub fn get(&self, id: usize) -> Option<&FileNode> {
-        self.nodes.get(id)
+        self.nodes.get(id).filter(|n| !n.deleted)
     }
 
     pub fn get_mut(&mut self, id: usize) -> Option<&mut FileNode> {
-        self.nodes.get_mut(id)
+        self.nodes.get_mut(id).filter(|n| !n.deleted)
     }
 
     pub fn add_child(&mut self, parent_id: usize, mut node: FileNode) -> usize {
@@ -133,11 +149,10 @@ impl FileTree {
         self.nodes.push(node);
         self.nodes[parent_id].children.push(new_id);
 
-        // Propagate size and counts upward
         let mut curr = Some(parent_id);
         while let Some(pid) = curr {
             let parent = &mut self.nodes[pid];
-            parent.size += node_size;
+            parent.size = parent.size.saturating_add(node_size);
             if is_dir {
                 parent.dir_count += 1;
             } else {
@@ -151,7 +166,7 @@ impl FileTree {
     }
 
     pub fn update_node_size(&mut self, node_id: usize, new_direct_size: u64) {
-        if node_id >= self.nodes.len() {
+        if node_id >= self.nodes.len() || self.nodes[node_id].deleted || self.nodes[node_id].is_dir() {
             return;
         }
         let old_size = self.nodes[node_id].direct_size;
@@ -164,24 +179,94 @@ impl FileTree {
             let diff = new_direct_size - old_size;
             let mut curr = Some(node_id);
             while let Some(id) = curr {
-                self.nodes[id].size += diff;
+                self.nodes[id].size = self.nodes[id].size.saturating_add(diff);
                 curr = self.nodes[id].parent;
             }
         } else {
             let diff = old_size - new_direct_size;
             let mut curr = Some(node_id);
             while let Some(id) = curr {
-                if self.nodes[id].size >= diff {
-                    self.nodes[id].size -= diff;
-                }
+                self.nodes[id].size = self.nodes[id].size.saturating_sub(diff);
                 curr = self.nodes[id].parent;
             }
         }
         self.total_size = self.nodes[self.root_id].size;
     }
 
+    pub fn remove_node(&mut self, node_id: usize) -> Vec<PathBuf> {
+        if node_id == self.root_id || node_id >= self.nodes.len() || self.nodes[node_id].deleted {
+            return Vec::new();
+        }
+
+        let removed_size = self.nodes[node_id].size;
+        let removed_files = self.nodes[node_id].file_count;
+        let removed_dirs = self.nodes[node_id].dir_count;
+        let parent_id = self.nodes[node_id].parent;
+
+        if let Some(pid) = parent_id {
+            self.nodes[pid].children.retain(|&cid| cid != node_id);
+        }
+
+        let mut curr = parent_id;
+        while let Some(id) = curr {
+            let ancestor = &mut self.nodes[id];
+            ancestor.size = ancestor.size.saturating_sub(removed_size);
+            ancestor.file_count = ancestor.file_count.saturating_sub(removed_files);
+            ancestor.dir_count = ancestor.dir_count.saturating_sub(removed_dirs);
+            curr = ancestor.parent;
+        }
+
+        let mut removed_paths = Vec::new();
+        let mut stack = vec![node_id];
+        while let Some(id) = stack.pop() {
+            if id < self.nodes.len() && !self.nodes[id].deleted {
+                self.nodes[id].deleted = true;
+                removed_paths.push(self.nodes[id].path.clone());
+                let children = std::mem::take(&mut self.nodes[id].children);
+                stack.extend(children);
+            }
+        }
+
+        self.total_size = self.nodes[self.root_id].size;
+        removed_paths
+    }
+
+    pub fn clear_children(&mut self, dir_id: usize) -> Vec<PathBuf> {
+        if dir_id >= self.nodes.len() || self.nodes[dir_id].deleted || !self.nodes[dir_id].is_dir() {
+            return Vec::new();
+        }
+
+        let children = std::mem::take(&mut self.nodes[dir_id].children);
+        let removed_size = self.nodes[dir_id].size.saturating_sub(self.nodes[dir_id].direct_size);
+        let removed_files = self.nodes[dir_id].file_count;
+        let removed_dirs = self.nodes[dir_id].dir_count.saturating_sub(1);
+
+        let mut curr = Some(dir_id);
+        while let Some(id) = curr {
+            let node = &mut self.nodes[id];
+            node.size = node.size.saturating_sub(removed_size);
+            node.file_count = node.file_count.saturating_sub(removed_files);
+            node.dir_count = node.dir_count.saturating_sub(removed_dirs);
+            curr = node.parent;
+        }
+
+        let mut removed_paths = Vec::new();
+        let mut stack = children;
+        while let Some(id) = stack.pop() {
+            if id < self.nodes.len() && !self.nodes[id].deleted {
+                self.nodes[id].deleted = true;
+                removed_paths.push(self.nodes[id].path.clone());
+                let sub = std::mem::take(&mut self.nodes[id].children);
+                stack.extend(sub);
+            }
+        }
+
+        self.total_size = self.nodes[self.root_id].size;
+        removed_paths
+    }
+
     pub fn set_flash(&mut self, node_id: usize, duration: std::time::Duration) {
-        if let Some(node) = self.nodes.get_mut(node_id) {
+        if let Some(node) = self.get_mut(node_id) {
             node.flash_until = Some(SystemTime::now() + duration);
         }
     }

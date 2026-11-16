@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::{
+    cursor::Show,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -14,8 +15,19 @@ use ratatui::{
     layout::{Position, Rect},
 };
 
+use spacemap::actions::run_editor_blocking;
 use spacemap::app::{App, InputMode, Modal};
 use spacemap::ui::{draw, treemap_area};
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show);
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -32,17 +44,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("    Up/Down/Left/Right or h/j/k/l  Move selection across treemap blocks spatially");
         println!("    Enter               Zoom into selected directory (drill-down)");
         println!("    Esc / Backspace / u Zoom out to parent directory / level");
-        println!("    Home                Return to root view");
+        println!("    Home / gg           Return to root view");
         println!("    + / -               Show more / fewer nested tiles");
         println!("    f                   Cycle colors (Classic, File Types, Depth)");
-        println!(
-            "    1, 2, 3, 4          Toggle 4-color tags (Red, Green, Yellow, Blue)"
-        );
+        println!("    1, 2, 3, 4          Toggle 4-color tags (Red, Green, Yellow, Blue)");
         println!("    0 or x              Clear tag on selected item");
         println!("    Space or a          Open Explorer-style action menu / context tools");
-        println!("    o                   Open with default system application (xdg-open)");
+        println!("    o                   Open with default system application");
         println!("    e or v              Open in editor ($EDITOR or nvim)");
-        println!("    t                   Open terminal in directory ($SHELL)");
+        println!("    t                   Open terminal in directory");
         println!("    y                   Copy absolute path to clipboard");
         println!("    d                   Delete / trash selected item (with confirmation)");
         println!("    i                   Inspect file properties modal");
@@ -55,7 +65,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("spacemap 0.1.0 (Ubuntu x86_64)");
+        println!(
+            "spacemap {} ({} {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
         return Ok(());
     }
 
@@ -70,24 +85,39 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
-    // Terminal initialization
+    if !root_path.is_dir() {
+        eprintln!("Error: Path '{}' is not a directory.", root_path.display());
+        std::process::exit(1);
+    }
+
+    if let Err(err) = std::fs::read_dir(&root_path) {
+        eprintln!(
+            "Error: Cannot read directory '{}': {}",
+            root_path.display(),
+            err
+        );
+        std::process::exit(1);
+    }
+
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show);
+        default_hook(panic_info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let _guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let app = App::new(root_path);
     let res = run_app(&mut terminal, app);
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    drop(_guard);
 
     if let Err(err) = res {
         eprintln!("Application Error: {:?}", err);
@@ -102,10 +132,31 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
     let mut last_click = None;
 
     loop {
-        // App update for scanner messages and background events
         app.update();
 
-        // Render UI
+        if let Some(editor_path) = app.pending_editor_path.take() {
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture,
+                Show
+            )?;
+            let res = run_editor_blocking(&editor_path);
+            execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                EnableMouseCapture
+            )?;
+            enable_raw_mode()?;
+            terminal.clear()?;
+            app.last_layout_rect = Rect::default();
+            match res {
+                Ok(_) => app.set_status(&format!("Edited: {}", editor_path.display())),
+                Err(e) => app.set_status(&format!("Error: {}", e)),
+            }
+        }
+
         terminal.draw(|f| {
             let canvas_rect = treemap_area(f.area());
             if app.last_layout_rect != canvas_rect {
@@ -163,7 +214,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
                 }
                 Event::Resize(_, _) => {
                     last_click = None;
-                    app.last_layout_rect = Rect::default(); // Force recompute
+                    app.last_layout_rect = Rect::default();
                 }
                 _ => {}
             }

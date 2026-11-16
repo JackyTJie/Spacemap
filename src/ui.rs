@@ -11,7 +11,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, InputMode, Modal};
-use crate::model::{FileClass, FileNode, format_size};
+use crate::model::{FileClass, FileKind, FileNode, format_size};
 use crate::treemap::VisibleTile;
 use crate::view::ColorMode;
 
@@ -38,8 +38,8 @@ pub fn treemap_area(area: Rect) -> Rect {
     Rect::new(
         area.x + margin,
         area.y + HEADER_ROWS,
-        area.width - 2 * margin,
-        area.height - HEADER_ROWS - FOOTER_ROWS,
+        area.width.saturating_sub(2 * margin),
+        area.height.saturating_sub(HEADER_ROWS + FOOTER_ROWS),
     )
 }
 
@@ -78,7 +78,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let count = format!("{} items", format_count(app.total_scanned_items));
+    let mut count = format!("{} items", format_count(app.total_scanned_items));
+    if app.scan_error_count > 0 && area.width >= 56 {
+        count.push_str(&format!(" · {} skipped", format_count(app.scan_error_count)));
+    }
     let status = match (app.is_scanning, area.width) {
         (_, 0..=25) => String::new(),
         (true, 44..) => format!("Scanning · {count}"),
@@ -113,9 +116,14 @@ fn draw_breadcrumbs(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let mut summary = format_size(root.size);
+    let root_display_size = tab
+        .treemap
+        .tiles
+        .first()
+        .map_or(root.size, |t| t.display_size);
+    let mut summary = format_size(root_display_size);
     if tab.root_node_id != app.tree.root_id && area.width >= 52 {
-        let share = 100.0 * root.size as f64 / app.tree.total_size.max(1) as f64;
+        let share = 100.0 * root_display_size as f64 / app.tree.total_size.max(1) as f64;
         summary.push_str(&format!(" · {share:.1}% of scan"));
     }
     let (left, right) = split_right(area, summary.as_str().width() as u16);
@@ -170,7 +178,6 @@ fn draw_treemap(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // The breadcrumb represents the root. Its children occupy the map directly.
     for tile in tab.treemap.tiles.iter().skip(1) {
         if let Some(node) = app.tree.get(tile.node_id) {
             draw_tile(
@@ -230,10 +237,12 @@ fn draw_tile(
     if let Some(tag) = node.tag {
         let (_, color) = get_tag_color(tag);
         let x = area.x + u16::from(outline);
-        f.render_widget(
-            Paragraph::new(Span::styled("▪", bold(color))),
-            Rect::new(x, area.y, 1, 1),
-        );
+        if x < area.right() {
+            f.render_widget(
+                Paragraph::new(Span::styled("▪", bold(color))),
+                Rect::new(x, area.y, 1, 1),
+            );
+        }
     }
 
     if area.width < 8 || area.height < 2 {
@@ -241,9 +250,12 @@ fn draw_tile(
     }
 
     let left = tag_width + 1;
-    let width = (area.width - left - 1) as usize;
+    let width = area.width.saturating_sub(left + 1) as usize;
+    if width == 0 {
+        return;
+    }
     let title_row = Rect::new(area.x + left, area.y, width as u16, 1);
-    let size = format_size(node.size);
+    let size = format_size(tile.display_size);
     let title_fg = if compact_focus { PAPER } else { INK };
     let details_fg = if compact_focus {
         PAPER
@@ -260,7 +272,6 @@ fn draw_tile(
         ));
     }
     if outline {
-        // The title replaces just the part of the top edge it uses.
         let label_area = Rect::new(title_row.x, title_row.y, title.width() as u16, 1);
         f.render_widget(Clear, label_area);
         fill(f, label_area, background);
@@ -290,7 +301,7 @@ fn tile_fill(tile: &VisibleTile, class: FileClass, mode: ColorMode) -> Color {
 
     match mode {
         ColorMode::Flat => shades[(tile.node_id + tile.depth) % shades.len()],
-        ColorMode::Depth => shades[(tile.depth - 1) % shades.len()],
+        ColorMode::Depth => shades[tile.depth.saturating_sub(1) % shades.len()],
         ColorMode::FileClasses => match class {
             FileClass::Archive | FileClass::DiskImage => Color::Rgb(207, 155, 135),
             FileClass::Media => Color::Rgb(176, 155, 192),
@@ -309,11 +320,13 @@ fn draw_selection(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let size = format_size(node.size);
+    let tile_opt = tab.treemap.tiles.iter().find(|t| t.node_id == node.id);
+    let shown_size = tile_opt.map_or(node.size, |t| t.display_size);
+    let size = format_size(shown_size);
     let mut summary = Line::from(Span::styled(size, bold(INK)));
     if area.width >= 44
         && node.id != tab.root_node_id
-        && let Some(tile) = tab.treemap.tiles.iter().find(|t| t.node_id == node.id)
+        && let Some(tile) = tile_opt
     {
         summary.spans.push(Span::styled(
             format!(" · {:.1}%", tile.share_of_parent * 100.0),
@@ -367,20 +380,25 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             };
             f.render_widget(
                 Paragraph::new(Span::styled(label, bold(FOCUS))),
-                Rect::new(area.x, area.y, 2, 1),
+                Rect::new(area.x, area.y, 2.min(area.width), 1),
             );
-            let area = Rect::new(area.x + 2, area.y, area.width - 2, 1);
+            let input_area = Rect::new(
+                area.x.saturating_add(2).min(area.right()),
+                area.y,
+                area.width.saturating_sub(2),
+                1,
+            );
             let mut line = Line::from(vec![
                 Span::styled(input, Style::new().fg(INK)),
                 Span::styled("▏", bold(FOCUS)),
             ]);
-            if line.width() > area.width as usize {
+            if line.width() > input_area.width as usize {
                 line = line.right_aligned();
             } else if input.is_empty() && hint.width() + 5 <= width {
                 line.spans
                     .push(Span::styled(format!("  {hint}"), Style::new().fg(MUTED)));
             }
-            f.render_widget(Paragraph::new(line), area);
+            f.render_widget(Paragraph::new(line), input_area);
             return;
         }
         InputMode::Normal => {
@@ -437,8 +455,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let lines = vec![
         shortcuts(&[("Arrows / h j k l", "Move selection")]),
         shortcuts(&[("Enter", "Zoom in"), ("Esc / Backspace / u", "Zoom out")]),
-        shortcuts(&[("Home", "Scan root"), ("+ / -", "Detail"), ("f", "Colors")]),
-        shortcuts(&[("Tab / Shift+Tab", "Switch views")]),
+        shortcuts(&[("Home / gg", "Scan root"), ("+ / -", "Detail"), ("f", "Colors")]),
+        shortcuts(&[("Tab / gt / gT", "Switch views")]),
         Line::default(),
         shortcuts(&[("/", "Filter"), (":", "Command"), ("Space / a", "Actions")]),
         shortcuts(&[("1–4", "Tag"), ("0 / x", "Clear tag"), ("i", "Properties")]),
@@ -494,16 +512,15 @@ fn draw_inspector(f: &mut Frame, app: &App, area: Rect) {
             || "Unknown".to_owned(),
             |t| t.format("%Y-%m-%d %H:%M:%S").to_string(),
         );
+    let kind_label = match node.kind {
+        FileKind::Directory => "Directory",
+        FileKind::File => "File",
+        FileKind::Symlink => "Symlink",
+        FileKind::Other => "Special",
+    };
     let fields = [
         ("Path", node.path.to_string_lossy().into_owned()),
-        (
-            "Type",
-            if node.is_dir() {
-                "Directory".into()
-            } else {
-                "File".into()
-            },
-        ),
+        ("Type", kind_label.into()),
         ("Size", format_size(node.size)),
         ("Direct size", format!("{} bytes", node.direct_size)),
         ("Files", format_count(node.file_count)),
@@ -530,25 +547,28 @@ fn draw_inspector(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_confirm_delete(f: &mut Frame, path: &Path, area: Rect) {
     let lines = vec![
-        Line::from("Permanently delete this item?"),
+        Line::from("Delete or move this item to trash?"),
         Line::from(Span::styled(path.to_string_lossy(), bold(INK))),
         Line::default(),
-        shortcuts(&[("y", "Delete permanently"), ("n / Esc", "Cancel")]),
+        shortcuts(&[("y", "Confirm delete"), ("n / Esc", "Cancel")]),
     ];
     dialog(f, area, "Confirm deletion", 64, lines, DANGER);
 }
 
 fn dialog(f: &mut Frame, area: Rect, title: &str, width: u16, lines: Vec<Line<'_>>, accent: Color) {
-    let width = width.min(area.width - 2);
-    let inner_width = width - 4;
+    if area.width < 6 || area.height < 4 {
+        return;
+    }
+    let width = width.min(area.width.saturating_sub(2)).max(6);
+    let inner_width = width.saturating_sub(4).max(1);
     let content_rows: usize = lines
         .iter()
         .map(|line| line.width().div_ceil(inner_width as usize).max(1))
         .sum();
     let height = (content_rows + 4).min(area.height as usize) as u16;
     let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
     );

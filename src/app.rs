@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 
-use crate::actions::{copy_to_clipboard, delete_item, open_default, open_in_editor, open_in_file_manager, open_terminal_here};
+use crate::actions::{
+    copy_to_clipboard, delete_item, open_default, open_in_file_manager, open_terminal_here,
+};
 use crate::export::export_text_report;
-use crate::model::{FileKind, FileNode, FileTree};
+use crate::model::{FileNode, FileTree};
 use crate::scanner::{start_scanner, ScannerController, ScannerMsg};
 use crate::treemap::Direction;
 use crate::view::{ColorMode, TabView};
@@ -40,11 +42,16 @@ pub struct App {
     pub is_scanning: bool,
     pub scan_progress: String,
     pub total_scanned_items: usize,
+    pub scan_error_count: usize,
+    pub last_scan_error: Option<String>,
     pub path_to_id: HashMap<PathBuf, usize>,
     pub scanner_rx: Receiver<ScannerMsg>,
     pub scanner_controller: ScannerController,
     pub should_quit: bool,
+    pub pending_editor_path: Option<PathBuf>,
+    pub pending_g_key: bool,
     pub last_layout_rect: Rect,
+    pub last_layout_update: Instant,
 }
 
 impl App {
@@ -71,11 +78,18 @@ impl App {
             is_scanning: true,
             scan_progress: "0 items".to_string(),
             total_scanned_items: 0,
+            scan_error_count: 0,
+            last_scan_error: None,
             path_to_id,
             scanner_rx,
             scanner_controller,
             should_quit: false,
+            pending_editor_path: None,
+            pending_g_key: false,
             last_layout_rect: Rect::default(),
+            last_layout_update: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
         }
     }
 
@@ -93,7 +107,6 @@ impl App {
     }
 
     pub fn update(&mut self) {
-        // Clear old status message after 4 seconds
         if let Some(t) = self.status_message_time {
             if t.elapsed() > Duration::from_secs(4) {
                 self.status_message = None;
@@ -101,19 +114,29 @@ impl App {
             }
         }
 
-        // Process incoming messages from scanner
         let mut tree_changed = false;
+        let mut scan_just_finished = false;
         while let Ok(msg) = self.scanner_rx.try_recv() {
             match msg {
                 ScannerMsg::Batch(items) => {
                     for item in items {
-                        let parent_id = self.path_to_id.get(&item.parent_path).copied().unwrap_or(0);
-                        let kind = if item.is_dir { FileKind::Directory } else { FileKind::File };
+                        if let Some(&existing_id) = self.path_to_id.get(&item.path) {
+                            if self.tree.get(existing_id).is_some() {
+                                self.tree.update_node_size(existing_id, item.size);
+                                continue;
+                            }
+                        }
+                        let Some(&parent_id) = self.path_to_id.get(&item.parent_path) else {
+                            continue;
+                        };
+                        if self.tree.get(parent_id).is_none() {
+                            continue;
+                        }
                         let node = FileNode::new(
-                            0, // Will be set by add_child
+                            0,
                             item.path.clone(),
                             item.name,
-                            kind,
+                            item.kind,
                             item.size,
                             item.modified,
                         );
@@ -122,32 +145,58 @@ impl App {
                     }
                     tree_changed = true;
                 }
-                ScannerMsg::Progress { scanned_items, current_path: _, .. } => {
+                ScannerMsg::Progress {
+                    scanned_items,
+                    current_path: _,
+                    ..
+                } => {
                     self.total_scanned_items = scanned_items;
                     self.scan_progress = format!("{} items", scanned_items);
                 }
-                ScannerMsg::Finished { total_items, .. } => {
+                ScannerMsg::Finished { .. } => {
                     self.is_scanning = false;
-                    self.total_scanned_items = total_items;
+                    let root = &self.tree.nodes[self.tree.root_id];
+                    self.total_scanned_items =
+                        root.file_count + root.dir_count.saturating_sub(1);
                     tree_changed = true;
+                    scan_just_finished = true;
                 }
                 ScannerMsg::LiveChange { path, .. } => {
                     if let Some(&node_id) = self.path_to_id.get(&path) {
-                        if let Ok(metadata) = std::fs::metadata(&path) {
-                            self.tree.update_node_size(node_id, metadata.len());
-                            self.tree.set_flash(node_id, Duration::from_millis(1500));
+                        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                            if metadata.file_type().is_file() {
+                                self.tree.update_node_size(node_id, metadata.len());
+                                self.tree.set_flash(node_id, Duration::from_millis(1500));
+                                tree_changed = true;
+                            }
+                        } else {
+                            let removed = self.tree.remove_node(node_id);
+                            for p in removed {
+                                self.path_to_id.remove(&p);
+                            }
                             tree_changed = true;
                         }
                     }
                 }
                 ScannerMsg::Error(err) => {
-                    self.set_status(&format!("Warning: {}", err));
+                    self.scan_error_count += 1;
+                    self.last_scan_error = Some(err.clone());
+                    self.set_status(&format!(
+                        "Skipped ({} total): {}",
+                        self.scan_error_count, err
+                    ));
                 }
             }
         }
 
-        if tree_changed && self.last_layout_rect.width > 0 {
+        if tree_changed
+            && self.last_layout_rect.width > 0
+            && (scan_just_finished
+                || !self.is_scanning
+                || self.last_layout_update.elapsed() >= Duration::from_millis(150))
+        {
             self.recompute_layout(self.last_layout_rect);
+            self.last_layout_update = Instant::now();
         }
     }
 
@@ -157,6 +206,10 @@ impl App {
         if canvas_rect.is_empty() {
             tab.treemap.tiles.clear();
             return;
+        }
+        if self.tree.get(tab.root_node_id).is_none() {
+            tab.root_node_id = self.tree.root_id;
+            tab.zoom_history.retain(|&id| self.tree.get(id).is_some());
         }
         let root_id = tab.root_node_id;
         let min_wh = tab.detail_level;
@@ -172,13 +225,31 @@ impl App {
             &|node| filter_criteria.matches(node),
         );
 
-        // Ensure selected_node_id is valid
-        if !tab.treemap.tiles.iter().any(|t| t.node_id == tab.selected_node_id) {
-            tab.selected_node_id = tab.treemap.tiles.first().map(|t| t.node_id).unwrap_or(root_id);
+        if !tab
+            .treemap
+            .tiles
+            .iter()
+            .any(|t| t.node_id == tab.selected_node_id)
+        {
+            tab.selected_node_id = tab
+                .treemap
+                .tiles
+                .get(1)
+                .or_else(|| tab.treemap.tiles.first())
+                .map(|t| t.node_id)
+                .unwrap_or(root_id);
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+
         match self.input_mode {
             InputMode::Normal => self.handle_normal_key(key),
             InputMode::Command => self.handle_command_key(key),
@@ -187,18 +258,22 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
-        // Modal handling first
         if let Some(modal) = &self.modal {
+            self.pending_g_key = false;
             match modal {
                 Modal::Help | Modal::Inspector => {
-                    if key.code == KeyCode::Esc || key.code == KeyCode::Char('?') || key.code == KeyCode::Char('i') {
+                    if key.code == KeyCode::Esc
+                        || key.code == KeyCode::Char('?')
+                        || key.code == KeyCode::Char('i')
+                        || key.code == KeyCode::Char('q')
+                    {
                         self.modal = None;
                     }
                     return;
                 }
                 Modal::ActionMenu => {
                     match key.code {
-                        KeyCode::Esc => self.modal = None,
+                        KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
                         KeyCode::Char('1') => {
                             self.modal = None;
                             self.action_open_default();
@@ -229,7 +304,12 @@ impl App {
                         KeyCode::Char('8') => {
                             let path = self.get_selected_path();
                             if let Some(p) = path {
-                                self.modal = Some(Modal::ConfirmDelete(p));
+                                if p == self.tree.nodes[self.tree.root_id].path {
+                                    self.modal = None;
+                                    self.set_status("Cannot delete scan root directory.");
+                                } else {
+                                    self.modal = Some(Modal::ConfirmDelete(p));
+                                }
                             } else {
                                 self.modal = None;
                             }
@@ -243,7 +323,19 @@ impl App {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             match delete_item(&path) {
-                                Ok(_) => self.set_status(&format!("Deleted: {}", path.display())),
+                                Ok(_) => {
+                                    if let Some(&node_id) = self.path_to_id.get(&path) {
+                                        let removed = self.tree.remove_node(node_id);
+                                        for p in removed {
+                                            self.path_to_id.remove(&p);
+                                        }
+                                        let root = &self.tree.nodes[self.tree.root_id];
+                                        self.total_scanned_items = root.file_count
+                                            + root.dir_count.saturating_sub(1);
+                                        self.recompute_layout(self.last_layout_rect);
+                                    }
+                                    self.set_status(&format!("Deleted: {}", path.display()));
+                                }
                                 Err(e) => self.set_status(&format!("Error: {}", e)),
                             }
                             self.modal = None;
@@ -259,15 +351,43 @@ impl App {
             }
         }
 
-        // Standard Normal mode bindings
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            self.pending_g_key = false;
+            return;
+        }
+
+        if self.pending_g_key {
+            self.pending_g_key = false;
+            match key.code {
+                KeyCode::Char('t') => {
+                    self.next_tab();
+                    return;
+                }
+                KeyCode::Char('T') => {
+                    self.prev_tab();
+                    return;
+                }
+                KeyCode::Char('g') => {
+                    let root_id = self.tree.root_id;
+                    self.current_tab_mut().root_node_id = root_id;
+                    self.current_tab_mut().selected_node_id = root_id;
+                    self.current_tab_mut().zoom_history.clear();
+                    self.recompute_layout(self.last_layout_rect);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
-            // Spatial 2D navigation: arrows or vim hjkl
             KeyCode::Left | KeyCode::Char('h') => self.navigate(Direction::Left),
             KeyCode::Right | KeyCode::Char('l') => self.navigate(Direction::Right),
             KeyCode::Up | KeyCode::Char('k') => self.navigate(Direction::Up),
             KeyCode::Down | KeyCode::Char('j') => self.navigate(Direction::Down),
 
-            // Zoom in: Enter (expand folder branch to fill work area)
             KeyCode::Enter => {
                 let tab = self.current_tab();
                 let sel_id = tab.selected_node_id;
@@ -281,7 +401,6 @@ impl App {
                 }
             }
 
-            // Zoom out: Esc / Backspace / u
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('u') => {
                 if self.current_tab_mut().zoom_out() {
                     self.recompute_layout(self.last_layout_rect);
@@ -290,7 +409,6 @@ impl App {
                 }
             }
 
-            // Home: Jump to view root
             KeyCode::Home => {
                 let root_id = self.tree.root_id;
                 self.current_tab_mut().root_node_id = root_id;
@@ -299,14 +417,12 @@ impl App {
                 self.recompute_layout(self.last_layout_rect);
             }
 
-            // Tagging: 1, 2, 3, 4
             KeyCode::Char('1') => self.toggle_tag(1),
             KeyCode::Char('2') => self.toggle_tag(2),
             KeyCode::Char('3') => self.toggle_tag(3),
             KeyCode::Char('4') => self.toggle_tag(4),
             KeyCode::Char('0') | KeyCode::Char('x') => self.clear_tag(),
 
-            // More / Less detail: + / -
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 let tab = self.current_tab_mut();
                 if tab.detail_level > 2 {
@@ -322,7 +438,6 @@ impl App {
                 }
             }
 
-            // Color mode toggle: f
             KeyCode::Char('f') => {
                 let tab = self.current_tab_mut();
                 tab.color_mode = match tab.color_mode {
@@ -338,7 +453,6 @@ impl App {
                 self.set_status(message);
             }
 
-            // Modals & Actions
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::Char(' ') | KeyCode::Char('a') => self.modal = Some(Modal::ActionMenu),
             KeyCode::Char('i') => self.modal = Some(Modal::Inspector),
@@ -348,15 +462,17 @@ impl App {
             KeyCode::Char('y') => self.action_copy_path(),
             KeyCode::Char('d') => {
                 if let Some(p) = self.get_selected_path() {
-                    self.modal = Some(Modal::ConfirmDelete(p));
+                    if p == self.tree.nodes[self.tree.root_id].path {
+                        self.set_status("Cannot delete scan root directory.");
+                    } else {
+                        self.modal = Some(Modal::ConfirmDelete(p));
+                    }
                 }
             }
             KeyCode::Char('r') => self.action_rescan_current(),
 
-            // Tabs: gt / gT
             KeyCode::Char('g') => {
-                // If followed by t or T
-                // In simplified single-key handler:
+                self.pending_g_key = true;
             }
             KeyCode::Tab => {
                 self.next_tab();
@@ -365,13 +481,11 @@ impl App {
                 self.prev_tab();
             }
 
-            // Neovim search / filter prompt: /
             KeyCode::Char('/') => {
                 self.input_mode = InputMode::Filter;
-                self.filter_input.clear();
+                self.filter_input = self.current_tab().filter_query.clone();
             }
 
-            // Neovim command prompt: :
             KeyCode::Char(':') => {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
@@ -386,6 +500,10 @@ impl App {
     }
 
     fn handle_command_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+            self.command_input.clear();
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
@@ -402,7 +520,11 @@ impl App {
                     self.input_mode = InputMode::Normal;
                 }
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+            {
                 self.command_input.push(c);
             }
             _ => {}
@@ -410,21 +532,34 @@ impl App {
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+            self.filter_input.clear();
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
+                self.filter_input = self.current_tab().filter_query.clone();
             }
             KeyCode::Enter => {
-                let filter_str = self.filter_input.clone();
+                let filter_str = self.filter_input.trim().to_string();
                 self.input_mode = InputMode::Normal;
                 self.current_tab_mut().set_filter(&filter_str);
                 self.recompute_layout(self.last_layout_rect);
-                self.set_status(&format!("Filter applied: {}", filter_str));
+                if filter_str.is_empty() {
+                    self.set_status("Filter cleared.");
+                } else {
+                    self.set_status(&format!("Filter applied: {}", filter_str));
+                }
             }
             KeyCode::Backspace => {
                 self.filter_input.pop();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+            {
                 self.filter_input.push(c);
             }
             _ => {}
@@ -442,8 +577,11 @@ impl App {
             "w" | "export" => {
                 let filename = parts.get(1).copied().unwrap_or("spacemap_report.txt");
                 let tab = self.current_tab();
-                match export_text_report(filename, &self.tree, tab.root_node_id, &tab.filter_query) {
-                    Ok(_) => self.set_status(&format!("Exported report to '{}' successfully!", filename)),
+                match export_text_report(filename, &self.tree, tab.root_node_id, &tab.filter_query)
+                {
+                    Ok(_) => {
+                        self.set_status(&format!("Exported report to '{}' successfully!", filename))
+                    }
                     Err(e) => self.set_status(&format!("Export failed: {}", e)),
                 }
             }
@@ -472,7 +610,17 @@ impl App {
                 let query = parts[1..].join(" ");
                 self.current_tab_mut().set_filter(&query);
                 self.recompute_layout(self.last_layout_rect);
-                self.set_status(&format!("Filter set: {}", query));
+                if query.is_empty() {
+                    self.set_status("Filter cleared.");
+                } else {
+                    self.set_status(&format!("Filter set: {}", query));
+                }
+            }
+            "noh" | "nofilter" => {
+                self.current_tab_mut().set_filter("");
+                self.filter_input.clear();
+                self.recompute_layout(self.last_layout_rect);
+                self.set_status("Filter cleared.");
             }
             "rescan" => {
                 self.action_rescan_current();
@@ -506,6 +654,9 @@ impl App {
                 let (name, _) = crate::ui::get_tag_color(tag_num);
                 self.set_status(&format!("Tagged as {}", name));
             }
+            if !self.current_tab().filter_criteria.is_empty() {
+                self.recompute_layout(self.last_layout_rect);
+            }
         }
     }
 
@@ -515,6 +666,9 @@ impl App {
         if let Some(node) = self.tree.get_mut(sel_id) {
             node.tag = None;
             self.set_status("Tag cleared.");
+            if !self.current_tab().filter_criteria.is_empty() {
+                self.recompute_layout(self.last_layout_rect);
+            }
         }
     }
 
@@ -561,10 +715,7 @@ impl App {
 
     fn action_open_editor(&mut self) {
         if let Some(path) = self.get_selected_path() {
-            match open_in_editor(&path) {
-                Ok(_) => self.set_status(&format!("Opening in editor: {}", path.display())),
-                Err(e) => self.set_status(&format!("Error: {}", e)),
-            }
+            self.pending_editor_path = Some(path);
         }
     }
 
@@ -588,9 +739,19 @@ impl App {
 
     fn action_rescan_current(&mut self) {
         let tab = self.current_tab();
-        let target_node = self.tree.get(tab.selected_node_id).or_else(|| self.tree.get(tab.root_node_id));
-        if let Some(node) = target_node {
+        let target_id = self
+            .tree
+            .get(tab.selected_node_id)
+            .and_then(|n| if n.is_dir() { Some(n.id) } else { n.parent })
+            .unwrap_or(tab.root_node_id);
+
+        if let Some(node) = self.tree.get(target_id) {
             let path = node.path.clone();
+            let removed = self.tree.clear_children(target_id);
+            for p in removed {
+                self.path_to_id.remove(&p);
+            }
+            self.recompute_layout(self.last_layout_rect);
             self.scanner_controller.rescan_subtree(path.clone());
             self.is_scanning = true;
             self.set_status(&format!("Rescanning subtree: {}", path.display()));

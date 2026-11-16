@@ -10,8 +10,8 @@ pub enum SizeFilter {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgeFilter {
-    NewerThan(Duration), // < 7d
-    OlderThan(Duration), // > 30d
+    NewerThan(Duration),
+    OlderThan(Duration),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,7 +24,7 @@ pub enum TagFilter {
 #[derive(Debug, Clone, Default)]
 pub struct FilterCriteria {
     pub raw_query: String,
-    pub name_patterns: Vec<(Pattern, bool)>, // (pattern, is_negated)
+    pub name_patterns: Vec<(Pattern, bool)>,
     pub size_filters: Vec<SizeFilter>,
     pub age_filters: Vec<AgeFilter>,
     pub tag_filter: Option<TagFilter>,
@@ -44,12 +44,7 @@ impl FilterCriteria {
             ..Default::default()
         };
 
-        // Split by semicolon or spaces
-        let tokens: Vec<&str> = trimmed
-            .split(|c| c == ';' || c == ' ')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let tokens = tokenize_query(trimmed);
 
         for token in tokens {
             if token == "is:dir" || token == "type:dir" {
@@ -69,8 +64,12 @@ impl FilterCriteria {
             } else if token.starts_with('>') || token.starts_with('<') {
                 let is_gt = token.starts_with('>');
                 let val_str = &token[1..];
-                // Could be size (>100M) or age (>30d)
-                if val_str.ends_with('d') || val_str.ends_with('h') || val_str.ends_with('m') || val_str.ends_with('y') {
+                if val_str.ends_with('d')
+                    || val_str.ends_with('h')
+                    || val_str.ends_with('m')
+                    || val_str.ends_with('w')
+                    || val_str.ends_with('y')
+                {
                     if let Some(dur) = parse_duration(val_str) {
                         if is_gt {
                             criteria.age_filters.push(AgeFilter::OlderThan(dur));
@@ -88,12 +87,15 @@ impl FilterCriteria {
                     }
                 }
             } else {
-                // Name / glob pattern
                 let (pattern_str, negated) = if let Some(p) = token.strip_prefix('!') {
                     (p, true)
                 } else {
-                    (token, false)
+                    (token.as_str(), false)
                 };
+
+                if pattern_str.is_empty() {
+                    continue;
+                }
 
                 let glob_str = if !pattern_str.contains('*') && !pattern_str.contains('?') {
                     format!("*{}*", pattern_str)
@@ -110,14 +112,15 @@ impl FilterCriteria {
         criteria
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.raw_query.is_empty()
+    }
+
     pub fn matches(&self, node: &FileNode) -> bool {
-        // If criteria is empty, match everything
         if self.raw_query.is_empty() {
             return true;
         }
 
-        // Directories: we always allow them if they might contain matching children,
-        // but if dirs_only is set, files are excluded.
         if self.dirs_only && !node.is_dir() {
             return false;
         }
@@ -125,82 +128,111 @@ impl FilterCriteria {
             return false;
         }
 
-        // For files, evaluate all filters
-        if !node.is_dir() {
-            // Tag filter
-            if let Some(ref tf) = self.tag_filter {
-                match tf {
-                    TagFilter::Specific(t) => {
-                        if node.tag != Some(*t) {
+        if node.is_dir() && !self.dirs_only {
+            return true;
+        }
+
+        if let Some(ref tf) = self.tag_filter {
+            match tf {
+                TagFilter::Specific(t) => {
+                    if node.tag != Some(*t) {
+                        return false;
+                    }
+                }
+                TagFilter::Any => {
+                    if node.tag.is_none() {
+                        return false;
+                    }
+                }
+                TagFilter::None => {
+                    if node.tag.is_some() {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        for sf in &self.size_filters {
+            match sf {
+                SizeFilter::GreaterThan(sz) => {
+                    if node.size <= *sz {
+                        return false;
+                    }
+                }
+                SizeFilter::LessThan(sz) => {
+                    if node.size >= *sz {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if !self.age_filters.is_empty() {
+            let Some(mod_time) = node.modified else {
+                return false;
+            };
+            let elapsed = SystemTime::now()
+                .duration_since(mod_time)
+                .unwrap_or(Duration::ZERO);
+            for af in &self.age_filters {
+                match af {
+                    AgeFilter::NewerThan(dur) => {
+                        if elapsed > *dur {
                             return false;
                         }
                     }
-                    TagFilter::Any => {
-                        if node.tag.is_none() {
-                            return false;
-                        }
-                    }
-                    TagFilter::None => {
-                        if node.tag.is_some() {
+                    AgeFilter::OlderThan(dur) => {
+                        if elapsed < *dur {
                             return false;
                         }
                     }
                 }
             }
+        }
 
-            // Size filter
-            for sf in &self.size_filters {
-                match sf {
-                    SizeFilter::GreaterThan(sz) => {
-                        if node.size <= *sz {
-                            return false;
-                        }
-                    }
-                    SizeFilter::LessThan(sz) => {
-                        if node.size >= *sz {
-                            return false;
-                        }
-                    }
-                }
+        let node_name_lower = node.name.to_lowercase();
+        for (pattern, negated) in &self.name_patterns {
+            let matched = pattern.matches(&node_name_lower);
+            if *negated && matched {
+                return false;
             }
-
-            // Age filter
-            if !self.age_filters.is_empty() {
-                if let Some(mod_time) = node.modified {
-                    if let Ok(elapsed) = SystemTime::now().duration_since(mod_time) {
-                        for af in &self.age_filters {
-                            match af {
-                                AgeFilter::NewerThan(dur) => {
-                                    if elapsed > *dur {
-                                        return false;
-                                    }
-                                }
-                                AgeFilter::OlderThan(dur) => {
-                                    if elapsed < *dur {
-                                        return false;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Name pattern filter
-            let node_name_lower = node.name.to_lowercase();
-            for (pattern, negated) in &self.name_patterns {
-                let matched = pattern.matches(&node_name_lower);
-                if *negated && matched {
-                    return false;
-                }
-                if !*negated && !matched {
-                    return false;
-                }
+            if !*negated && !matched {
+                return false;
             }
         }
 
         true
     }
+}
+
+fn tokenize_query(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut quote_char = '"';
+
+    for c in input.chars() {
+        if in_quotes {
+            if c == quote_char {
+                in_quotes = false;
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' || c == '\'' {
+            in_quotes = true;
+            quote_char = c;
+        } else if c == ';' || c.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 fn parse_size(s: &str) -> Option<u64> {
@@ -233,6 +265,9 @@ fn parse_size(s: &str) -> Option<u64> {
     };
 
     let num: f64 = num_part.trim().parse().ok()?;
+    if !num.is_finite() || num < 0.0 {
+        return None;
+    }
     Some((num * unit as f64) as u64)
 }
 
@@ -253,5 +288,5 @@ fn parse_duration(s: &str) -> Option<Duration> {
     };
 
     let num: u64 = num_part.parse().ok()?;
-    Some(Duration::from_secs(num * multiplier_secs))
+    Some(Duration::from_secs(num.saturating_mul(multiplier_secs)))
 }
