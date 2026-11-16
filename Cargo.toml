@@ -1,0 +1,16 @@
+[package]
+name = "spacemap"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+arboard = "3.7.0"
+chrono = "0.4.45"
+crossterm = "0.29.0"
+glob = "0.3.4"
+notify = "8.2.2"
+ratatui = "0.30.2"
+unicode-width = "0.2.3"
+walkdir = "2.5.0"
+
