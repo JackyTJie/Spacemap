@@ -2,7 +2,9 @@
 
 Inspired by SpaceSniffer, bringing its intuitive Treemap disk visualization to the Linux terminal.
 
-A high-performance, interactive terminal treemap disk usage analyzer written in **Rust**, replicating and enhancing the classic Windows **SpaceSniffer** experience directly within your Linux terminal.
+A high-performance, interactive terminal treemap disk usage analyzer written in **Rust**, replicating and enhancing the classic Windows **SpaceSniffer** experience directly within your terminal.
+
+![Spacemap Preview](assets/preview.webp)
 
 ---
 
@@ -122,7 +124,7 @@ spacemap
 
 ### 2. Analyze a Specific Mount Point or Directory
 ```bash
-spacemap /home/tj
+spacemap ~
 spacemap /var/log
 ```
 
